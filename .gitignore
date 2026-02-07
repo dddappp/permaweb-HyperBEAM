@@ -46,3 +46,9 @@ mkdocs-site-manifest.csv
 !test/admissible-report-wallet.json
 !test/admissible-report.json
 !test/config.json
+test-caching-*/*
+test-*-cache/*
+test-multi-tier
+test-remote-basic
+test-workflow-source
+test-cache-links
