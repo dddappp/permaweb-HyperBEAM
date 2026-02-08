@@ -666,20 +666,155 @@ resolve_fold(Message1, Msg2, 1, Opts)
 
 ## 七、HashPath管理
 
-### 7.1 为什么HashPath很重要
+### 7.1 核心定义：什么是HashPath
 
-HashPath是AO消息的"身份证"，证明消息的真实性和执行历史。当设备栈执行时：
+**HashPath是一个滚动的Merkle列表**，记录了生成给定消息所应用的所有消息的历史。这是AO网络可验证计算的核心机制。
 
-- 设备1处理 → 生成新的HashPath
-- 设备2处理 → 基于设备1的HashPath生成新的
-- ...
+**关键特性**：
 
-**必须保证HashPath的正确性，否则消息无效**
+| 特性 | 说明 |
+|------|------|
+| **密码学链** | 每个消息的HashPath包含其前驱消息的ID，通过哈希链接 |
+| **历史完整性** | 最终消息的HashPath代表完整的执行历史树 |
+| **可验证性** | 任何人都可以验证HashPath的正确性 |
+| **设备无关** | 无论执行哪个设备，HashPath都会正确更新 |
 
-### 7.2 dev_stack如何管理HashPath
+**生成规则**（来自 hb_path.erl 文档）：
+
+```
+Msg1.HashPath = Msg1.ID
+Msg3.HashPath = SHA256(Msg1.HashPath, Msg2.ID)
+Msg3.{...} = AO-Core.apply(Msg1, Msg2)
+```
+
+**重要说明**：
+- 消息的ID本身也包含其HashPath，形成嵌套结构
+- 每个新消息的HashPath = `SHA256(前一个HashPath, 新消息ID)`
+- 这允许单个消息代表一棵完整的消息历史树
+
+### 7.2 设备调用与HashPath更新的关系
+
+**核心发现**：每次设备调用都会产生新消息，并**立即**更新HashPath。
+
+**证据代码**（hb_ao.erl:621-645）：
 
 ```erlang
-%% dev_stack.erl:78-98 的说明：
+resolve_stage(9, Msg1, Msg2, {ok, Msg3}, ExecName, Opts) ->
+    ?event(ao_core, {stage, 9, ExecName, generate_hashpath}, Opts),
+    % Cryptographic linking. Now that we have generated the result, we
+    % need to cryptographically link the output to its input via a hashpath.
+    resolve_stage(10, Msg1, Msg2,
+        case hb_opts:get(hashpath, update, Opts#{ only => local }) of
+            update ->
+                NormMsg3 = Msg3,
+                Priv = hb_private:from_message(NormMsg3),
+                HP = hb_path:hashpath(Msg1, Msg2, Opts),  % ← 计算新HashPath
+                if not is_binary(HP) or not is_map(Priv) ->
+                    throw({invalid_hashpath, {hp, HP}, {msg3, NormMsg3}});
+                true ->
+                    {ok, NormMsg3#{ <<"priv">> => Priv#{ <<"hashpath">> => HP } }}
+                end;
+            ...
+        end,
+        ExecName,
+        Opts
+    );
+```
+
+**执行阶段详解**：
+
+```
+Msg1 ──→ [设备执行] ──→ Msg3
+  │          │
+  │          ↓
+  │     resolve_stage(6)  ← 设备查找和函数调用
+  │     resolve_stage(7)  ← 步骤钩子（可选）
+  │     resolve_stage(8)  ← 子解析（可选）
+  │          │
+  │          ↓
+  │     resolve_stage(9)  ← ★ 在这里更新HashPath！★
+  │          │
+  │          ↓
+  │     Msg3.priv.hashpath = Hash(Msg1.priv.hashpath, Msg2.ID)
+  │          │
+  │          ↓
+  └──→ 返回 Msg3
+```
+
+**三种HashPath更新模式**：
+
+```erlang
+case hb_opts:get(hashpath, update, Opts) of
+    update ->
+        % 正常模式：将Msg2添加到HashPath
+        HP = hb_path:hashpath(Msg1, Msg2, Opts),
+        {ok, Msg3#{ <<"priv">> => Priv#{ <<"hashpath">> => HP } }};
+    
+    reset ->
+        % 重置模式：清除HashPath（用于异常状态）
+        Priv = hb_private:from_message(Msg3),
+        {ok, Msg3#{ <<"priv">> => hb_maps:without([<<"hashpath">>], Priv, Opts) }};
+    
+    ignore ->
+        % 忽略模式：不修改HashPath
+        Priv = hb_private:from_message(Msg3),
+        {ok, Msg3}
+end
+```
+
+**设备栈执行中的HashPath更新示例**：
+
+```
+初始状态:
+  Msg1.priv.hashpath = "abc123"  ← 进程初始消息的HashPath
+  
+  │
+  ├─→ dedup@1.0 设备处理
+  │     Msg2_1 = #{ path => "dedup" }
+  │     ↓ resolve_stage(9)
+  │     Msg3_1.priv.hashpath = Hash("abc123", Msg2_1.ID)
+  │
+  ├─→ cron@1.0 设备处理
+  │     Msg2_2 = #{ path => "cron" }
+  │     ↓ resolve_stage(9)
+  │     Msg3_2.priv.hashpath = Hash(Msg3_1.priv.hashpath, Msg2_2.ID)
+  │
+  ├─→ lua@5.3a 设备处理
+  │     Msg2_3 = #{ path => "compute" }
+  │     ↓ resolve_stage(9)
+  │     Msg3_3.priv.hashpath = Hash(Msg3_2.priv.hashpath, Msg2_3.ID)
+  │
+  └─→ multipass@1.0 设备处理
+        Msg2_4 = #{ path => "multipass" }
+        ↓ resolve_stage(9)
+        Msg3_4.priv.hashpath = Hash(Msg3_3.priv.hashpath, Msg2_4.ID)
+        
+最终结果:
+  Msg3_4.priv.hashpath = Hash(Hash(Hash(Hash("abc123", Msg2_1.ID), Msg2_2.ID), Msg2_3.ID), Msg2_4.ID)
+```
+
+### 7.3 HashPath算法
+
+HyperBEAM实现了两种HashPath算法（hb_path.erl:13675-13704）：
+
+| 算法 | 说明 | 用途 |
+|------|------|------|
+| **`sha-256-chain`** | 简单的链式SHA-256哈希 | 默认算法，生产环境使用 |
+| **`accumulate-256`** | 累积多个ID的值到单个承诺 | 实验性，用于测试 |
+
+### 7.4 为什么HashPath完整性对设备栈至关重要
+
+**问题背景**：
+
+当`dev_stack`在设备之间委托调用时：
+- 需要切换当前执行的设备（修改`<<"device">>`字段）
+- 但不能破坏HashPath的完整性
+- 需要确保最终消息的HashPath正确反映完整的执行历史
+
+**dev_stack的解决方案**（dev_stack.erl:78-98）：
+
+```erlang
+%%% dev_stack.erl 的说明：
 %% Under-the-hood, dev_stack uses a `default' handler to resolve all calls to
 %% devices, aside `set/2' which it calls itself to mutate the message's `device'
 %% key in order to change which device is currently being executed. This method
@@ -687,19 +822,24 @@ HashPath是AO消息的"身份证"，证明消息的真实性和执行历史。�
 %% even as it delegates calls to other devices.
 ```
 
-**执行流程（保证HashPath正确）**：
+**关键机制**：
+- 使用`set/2`操作符修改设备字段
+- 同时维护正确的HashPath
+- 每次设备切换都通过`Set?device=...`调用
+
+**完整执行流程（保证HashPath正确）**：
 
 ```
 /Msg1/AlicesExcitingKey
     ↓ dev_stack:execute
     ↓
-/Msg1/Set?device=/Device-Stack/1  ← 设置当前设备为设备1
+/Msg1/Set?device=/Device-Stack/1  ← transform选择设备1，调用set更新
     ↓
-/Msg2/AlicesExcitingKey            ← 设备1执行，生成Msg2
+/Msg2/AlicesExcitingKey            ← 设备1执行，生成Msg2，HashPath更新
     ↓
-/Msg3/Set?device=/Device-Stack/2  ← 设置当前设备为设备2
+/Msg3/Set?device=/Device-Stack/2  ← transform选择设备2，调用set更新
     ↓
-/Msg4/AlicesExcitingKey            ← 设备2执行，生成Msg4
+/Msg4/AlicesExcitingKey            ← 设备2执行，生成Msg4，HashPath更新
     ↓
 ...                                ← 继续执行
     ↓
@@ -707,13 +847,24 @@ HashPath是AO消息的"身份证"，证明消息的真实性和执行历史。�
     ↓
 returns {ok, /MsgN+1}              ← 返回最终结果
     ↓
-/MsgN+1                            ← 最终消息
+/MsgN+1                            ← 最终消息，包含完整的HashPath链
 ```
 
-关键点：
-- 每次`Set?device=...`调用都会更新HashPath
-- 设备的执行基于正确的HashPath
-- 最终返回的消息包含完整的执行历史
+### 7.5 HashPath的价值总结
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                    HashPath的核心价值                        │
+├────────────────────────────────────────────────────────────┤
+│  ✓ 可验证性：任何人都可以验证消息的计算历史                   │
+│  ✓ 完整性：确保没有消息被遗漏或篡改                          │
+│  ✓ 追溯性：可以从最终状态追溯到最初的输入                     │
+│  ✓ 分布路由：节点可以根据hashpath将请求路由到正确位置         │
+│  ✓ 不可抵赖：发送的消息被记录在链中，无法否认                 │
+└────────────────────────────────────────────────────────────┘
+```
+
+> **系统设计启示**：HashPath机制使得AO网络中的计算具有密码学级别的可验证性，这正是去中心化信任的基石。
 
 ---
 
