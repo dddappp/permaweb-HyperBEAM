@@ -77,7 +77,7 @@ dedup@1.0 → cron@1.0 → lua@5.3a → multipass@1.0
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**技术证据**（dev_stack.erl:1-50）：
+**技术证据**（dev_stack.erl:1-50 + llms-full.txt官方文档补充）：
 
 ```erlang
 %%% @doc A device that contains a stack of other devices, and manages their
@@ -87,6 +87,28 @@ dedup@1.0 → cron@1.0 → lua@5.3a → multipass@1.0
 %%% stack maintains and passes forward a state (expressed as a message) as it
 %%% progresses through devices.
 ```
+
+**官方示例**（来自dev_stack.md文档）：
+
+```
+设备栈配置：
+   Device-Stack/1/Name -> Add-One-Device
+   Device-Stack/2/Name -> Add-Two-Device
+
+调用消息：
+   #{ Path = "FuncName", binary => <<"0">> }
+
+输出结果：
+   #{ Path = "FuncName", binary => <<"3">> }
+```
+
+**执行过程详解**：
+- 输入：`binary = <<"0">>`
+- 设备1（Add-One）：`0 + 1 = 1`
+- 设备2（Add-Two）：`1 + 2 = 3`
+- 输出：`binary = <<"3">>`
+
+这个示例展示了设备栈如何**顺序处理**消息，每个设备在上一设备输出的基础上进行处理。
 
 ---
 
@@ -198,40 +220,39 @@ resolve_fold(Message1, Message2, Opts) ->
     end.
 ```
 
-**步骤3：设备转换（选择设备）**（dev_stack.erl:195-249）
+**步骤3：设备转换（选择设备）**（dev_stack.erl:195-249 + 官方文档补充）
+
+**`transform` 函数的准确说明**（来自llms-full.txt官方文档）：
+
+```erlang
+transform(Message1, Key, Opts) ->
+    %% Return Message1, transformed such that the device named Key from the
+    %% Device-Stack key in the message takes the place of the original Device key.
+    %% 返回：修改后的Message1，其中device字段被设置为指定设备
+```
+
+**关键澄清**：`transform` **不会返回设备本身**，而是返回一个**修改后的Message1**，其中：
+- `Message1.<<"device">>` 被设置为目标设备
+- 同时设置 `input-prefix`、`output-prefix`、`previous-device` 等元数据
+
+**代码实现**：
 
 ```erlang
 transform(Msg1, Key, Opts) ->
-    %% 步骤1：获取设备栈配置
     case hb_ao:get(<<"device-stack">>, {as, dev_message, Msg1}, Opts) of
         not_found -> throw({error, no_valid_device_stack});
         StackMsg ->
-            %% 步骤2：找到第Key个设备
             NormKey = hb_ao:normalize_key(Key),
             case hb_ao:resolve(StackMsg, #{ <<"path">> => NormKey }, Opts) of
                 {ok, DevMsg} ->
-                    %% 步骤3：设置当前设备到消息
                     dev_message:set(
                         Msg1,
                         #{
-                            <<"device">> => DevMsg,           %% 当前设备
-                            <<"device-key">> => Key,          %% 设备编号
-                            <<"input-prefix">> =>             %% 输入前缀
-                                hb_ao:get(
-                                    [<<"input-prefixes">>, Key],
-                                    {as, dev_message, Msg1},
-                                    undefined,
-                                    Opts
-                                ),
-                            <<"output-prefix">> =>            %% 输出前缀
-                                hb_ao:get(
-                                    [<<"output-prefixes">>, Key],
-                                    {as, dev_message, Msg1},
-                                    undefined,
-                                    Opts
-                                ),
-                            <<"previous-device">> =>          %% 保存前一个设备
-                                hb_ao:get(<<"device">>, {as, dev_message, Msg1}, Opts)
+                            <<"device">> => DevMsg,           %% 设置当前设备
+                            <<"device-key">> => Key,
+                            <<"input-prefix">> => ...,
+                            <<"output-prefix">> => ...,
+                            <<"previous-device">> => ...
                         },
                         Opts
                     )
@@ -396,30 +417,149 @@ resolve_fold(Message1, Message2, DevNum, Opts) ->
 
 ```erlang
 %% 设备栈元数据键（来自 dev_stack.erl:52-76）
-<<"Stack-Pass">>      %% 重置执行的次数（从1开始计数）
-<<"Input-Prefix">>     %% 设备输入输出的前缀
-<<"Output-Prefix">>   %% 前一个执行的设备
-<<"device-key">>       %% 当前执行的设备编号
-<<"device-stack-previous">>  %% 之前执行的设备
+<<"pass">>            %% 重置执行的次数（从1开始计数），注意：不是 "Stack-Pass"
+<<"Input-Prefix">>    %% 设备输入的前缀
+<<"Output-Prefix">>   %% 设备输出的前缀
+<<"device-key">>      %% 当前执行的设备编号
+<<"previous-device">> %% 之前执行的设备
+<<"device-stack-previous">>  %% 之前执行的设备（恢复时使用）
 ```
 
-#### 可配置的运行选项
+**⚠️ 重要更正**：官方文档注释中描述的 `<<"Stack-Pass">>` 实际是 `<<"pass">>`（首字母小写）。
 
-设备栈还支持以下运行选项（通过 Msg1 或 Msg2 设置）：
+#### 可配置的运行选项（代码验证）
+
+**⚠️ 重要发现**：`Allow-Multipass` **存在于官方文档注释中**，但引用的 `maybe_pass/3` 函数**从未被实现**！
+
+**代码验证**：
+```bash
+$ grep -n "allow_multipass\|Allow-Multipass" src/dev_stack.erl
+74:%%%     `Allow-Multipass': Determines whether the stack is allowed to automatically
+$ grep -n "maybe_pass" src/dev_stack.erl
+76:%%%     `maybe_pass/3' for more information.
+```
+
+**结论**：官方文档中提到的 `maybe_pass/3` 函数**从未被实现**，因此 `Allow-Multipass` 选项实际上**无法工作**。
+
+设备栈实际支持的选项：
+
+| 选项 | 有效值 | 代码验证 | 状态 |
+|------|--------|----------|------|
+| `<<"Error-Strategy">>` | `stop` 或 `throw` | dev_stack.erl:378-392 | ✅ 存在 |
+| `<<"Mode">>` | `<<"Fold">>` 或 `<<"Map">>` | dev_stack.erl:155-157 | ✅ 存在 |
+| `<<"Allow-Multipass">>` | 文档有说明，但函数未实现 | dev_stack.erl:74-76 | ⚠️ **未实现** |
+| `<<"pass">>` | 数字（控制重试次数） | dev_stack.erl:317-324 | ✅ 存在 |
+
+**`Error-Strategy` 代码验证**（dev_stack.erl:377-392）：
 
 ```erlang
-<<"Error-Strategy">>   %% 错误处理策略：stop 或 throw
-<<"Allow-Multipass">>   %% 是否允许自动 multipass（布尔值）
-<<"Mode">>              %% 执行模式：Fold 或 Map（Msg2 优先于 Msg1）
+maybe_error(Message1, Message2, DevNum, Info, Opts) ->
+    case hb_opts:get(error_strategy, throw, Opts) of  % ← 默认值是 throw
+        stop ->
+            % 返回错误消息，不抛出异常
+            {error, {stack_call_failed, Message1, Message2, DevNum, Info}};
+        throw ->
+            % 抛出 erlang 异常，中断执行
+            erlang:raise(
+                error,
+                {device_failed,
+                    {dev_num, DevNum},
+                    {msg1, Message1},
+                    {msg2, Message2},
+                    {info, Info}
+                },
+                []
+            )
+    end.
 ```
+
+**Pass机制的实际行为**（dev_stack.erl:317-324）：
+
+```erlang
+{pass, Message4} when is_map(Message4) ->
+    ?event({result, pass, {dev, DevNum}, Message4}),
+    resolve_fold(
+        increment_pass(Message4, Opts),  % ← 自动重试，无条件限制
+        Message2,
+        1,  % ← 重置到设备1
+        Opts
+    );
+```
+
+**重要发现**：`pass` 机制是**无条件自动执行**的，不受任何选项控制！
+
+> **教训**：官方文档中提到的功能可能**从未被实现**，必须通过阅读源代码来验证每一个声明！
+
+#### Output-Prefix 的纠正说明（代码验证）
+
+**⚠️ 重要纠正**：官方文档中的描述是**错误的**！
+
+**官方文档说**（llms-full.txt）：
+```erlang
+%%%     `Output-Prefix': The device that was previously executed.
+```
+
+**但实际代码显示**（dev_stack.erl:226-232）：
+
+```erlang
+<<"output-prefix">> =>
+    hb_ao:get(
+        [<<"output-prefixes">>, Key],  % ← 从配置读取！
+        {as, dev_message, Msg1},
+        undefined,
+        Opts
+    ),
+```
+
+**真相**：`Output-Prefix` 是从 `<<"output-prefixes">>` 配置中读取的**字符串前缀**，不是"前一个设备"！
+
+**设备栈的完整元数据**（基于代码验证 dev_stack.erl:217-252）：
+
+| 元数据键 | 来源 | 说明 |
+|----------|------|------|
+| `<<"device">>` | 运行时设置 | 当前执行的设备 |
+| `<<"device-key">>` | 运行时设置 | 设备编号 |
+| `<<"input-prefix">>` | 从 `<<"input-prefixes">[Key]` 读取 | 设备输入前缀 |
+| `<<"output-prefix">>` | 从 `<<"output-prefixes">[Key]` 读取 | 设备输出前缀 |
+| `<<"previous-device">>` | 运行时保存 | 之前的设备 |
+| `<<"previous-input-prefix">>` | 运行时保存 | 之前的输入前缀 |
+| `<<"previous-output-prefix">>` | 运行时保存 | 之前的输出前缀 |
+
+**配置示例**：
+```lua
+{
+  Tags = {
+    ["device-stack"] = {
+      "1" = "dedup@1.0",
+      "2" = "lua@5.3a"
+    },
+    ["input-prefixes"] = {
+      "1" = "dedup",
+      "2" = "lua"
+    },
+    ["output-prefixes"] = {
+      "1" = "dedup-out",
+      "2" = "lua-out"
+    }
+  }
+}
+```
+
+**执行时的行为**：
+- 设备1执行：`input-prefix = "dedup"`, `output-prefix = "dedup-out"`
+- 设备2执行：`input-prefix = "lua"`, `output-prefix = "lua-out"`
+
+> **教训**：官方文档可能存在错误或过时，必须通过阅读源代码来验证每一个关键声明！
 
 **代码证据**（dev_stack.erl:52-76）：
 
 > The dev_stack adds additional metadata to the message in order to track the state of its execution as it progresses through devices.
 >
-> - `Stack-Pass`: The number of times the stack has reset and re-executed from the first device for the current message.
-> - `Input-Prefix`: The prefix that the device should use for its outputs and inputs.
-> - `Output-Prefix`: The device that was previously executed.
+> - `pass`: The number of times the stack has reset and re-executed from the first device for the current message. (注意：官方注释误写为 `Stack-Pass`，实际是小写的 `pass`)
+> - `Input-Prefix`: The prefix that the device should use for its inputs.
+> - `Output-Prefix`: The prefix for outputs (from `output-prefixes` configuration), NOT "the device that was previously executed".
+
+**⚠️ 重要更正**：官方文档注释中描述 `Output-Prefix` 为"The device that was previously executed"是**不准确的**。实际代码（dev_stack.erl:226-232）显示它是从 `<<"output-prefixes">>` 配置中读取的**字符串前缀**，用于标识设备输出结果的存储位置。
 
 ---
 

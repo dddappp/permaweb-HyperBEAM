@@ -52,3 +52,4 @@ test-multi-tier
 test-remote-basic
 test-workflow-source
 test-cache-links
+wao-test/node_modules
