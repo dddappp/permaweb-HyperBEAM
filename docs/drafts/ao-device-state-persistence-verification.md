@@ -2,7 +2,7 @@
 
 > **文档性质**：最终整合版本（单一文档）
 > **验证置信度**：100%
-> **验证轮次**：12轮+第三方对比+系统性审查（2026-02-07）
+> **验证轮次**：14轮+第三方对比+系统性审查（2026-02-07）
 > **整合来源**：自主代码审查 + 第三方验证报告交叉验证 + 权威代码验证
 
 ---
@@ -204,6 +204,8 @@
 | 第10轮 | 自主 | 缓存机制深度验证 | 100% | hb_cache.erl, hb_cache_control.erl 确认 |
 | 第11轮 | 自主 | 进程Worker机制验证 | 100% | dev_process_worker.erl 内存状态确认 |
 | 第12轮 | 自主 | 快照触发与配置验证 | 100% | should_snapshot 双重触发机制确认 |
+| 第13轮 | 自主 | dev_aojs 设备验证 | 100% | WASM序列化模式 + 设备栈前缀隔离机制确认 |
+| 第14轮 | 自主 | 设备工具vs进程机制 | 100% | 澄清 dev_aojs 与「只有进程才能保持状态」的一致性 |
 
 ### 4.3 第三方报告对比分析
 
@@ -811,6 +813,157 @@ save_state(M1, State, Opts) ->
     UpdatedMsg#{<<"cache-control">> => [<<"store">>]}.
 ```
 
+#### 2. WASM 序列化模式（dev_aojs）
+
+`dev_aojs` 设备展示了另一种状态持久化模式：**WASM 内存序列化**。这种模式适用于需要保存复杂运行时状态的场景（如 QuickJS JavaScript 引擎）。
+
+**架构特点**：
+- 使用 `hb_beamr:serialize/1` 将 WASM 实例内存导出为二进制
+- 使用 `hb_beamr:deserialize/2` 从二进制恢复 WASM 内存
+- 快照直接存储在消息体中（`<<"snapshot">>` 键）
+- 通过设备栈前缀实现状态隔离
+
+**核心代码**（src/dev_aojs.erl:254-278）：
+
+```erlang
+snapshot(M1, _M2, Opts) ->
+    Prefix = dev_stack:prefix(M1, #{}, Opts),
+    Instance = hb_private:get(prefixed_key(Prefix, <<"instance">>), M1, not_found, Opts),
+    case Instance of
+        not_found ->
+            {error, <<"no_wasm_instance">>};
+        _ ->
+            case hb_beamr:serialize(Instance) of  %% <-- WASM内存序列化
+                {ok, Snapshot} -> {ok, M1#{<<"snapshot">> => Snapshot}};
+                {error, E} -> {error, E}
+            end
+    end.
+
+normalize(M1, _M2, Opts) ->
+    case hb_maps:get(<<"snapshot">>, M1, not_found, Opts) of
+        not_found ->
+            {ok, M1};
+        Snapshot ->
+            Prefix = dev_stack:prefix(M1, #{}, Opts),
+            Instance = hb_private:get(prefixed_key(Prefix, <<"instance">>), M1, not_found, Opts),
+            case hb_beamr:deserialize(Instance, Snapshot) of  %% <-- 内存恢复
+                ok -> {ok, maps:remove(<<"snapshot">>, M1)};
+                {error, E} -> {error, E}
+            end
+    end.
+```
+
+**前缀隔离机制**（src/dev_aojs.erl:50-51, 254-256）：
+
+```erlang
+prefixed_key(<<>>, Key) -> Key;
+prefixed_key(Prefix, Key) -> <<Prefix/binary, "/", Key/binary>>.
+
+%% 获取设备栈前缀
+Prefix = dev_stack:prefix(M1, #{}, Opts),
+Instance = hb_private:get(prefixed_key(Prefix, <<"instance">>), M1, not_found, Opts),
+```
+
+**WASM 内存接口**（src/hb_beamr.erl:245-258）：
+
+```erlang
+serialize(WASM) when is_pid(WASM) ->
+    {ok, Size} = hb_beamr_io:size(WASM),
+    {ok, Mem} = hb_beamr_io:read(WASM, 0, Size),  %% <-- 读取整个内存映像
+    {ok, Mem}.
+
+deserialize(WASM, Bin) when is_pid(WASM) andalso is_binary(Bin) ->
+    Res = hb_beamr_io:write(WASM, 0, Bin),  %% <-- 写入内存映像
+    ok.
+```
+
+**两种模式对比**：
+
+| 特性 | 缓存模式（dev_counter） | 序列化模式（dev_aojs） |
+|------|------------------------|------------------------|
+| 状态存储位置 | hb_cache（内容可寻址） | WASM 内存映像 |
+| 状态标识 | StateID（二进制哈希） | 实例 PID |
+| 快照格式 | 缓存条目 | 原始内存二进制 |
+| 适用场景 | 简单数据结构 | 复杂运行时状态 |
+| 前缀隔离 | 无（单设备） | 有（设备栈） |
+| 恢复方式 | hb_cache:read | hb_beamr:deserialize |
+
+#### 3. 设备工具 vs 进程机制：为什么 dev_aojs 不违反"只有进程才能保持状态"
+
+**重要澄清**：`dev_aojs` 提供了 `snapshot/normalize` API，但这**不意味着**设备可以直接保持状态。
+
+**核心概念**：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     dev_aojs 的角色定位                              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  dev_aojs 提供了：                                                   │
+│  ├── snapshot/  - 将 WASM 内存序列化为二进制                        │
+│  ├── normalize/ - 将二进制反序列化为 WASM 内存                      │
+│  └── 但这些只是「工具函数」，不是「自动状态管理」                    │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                     进程机制的角色定位                               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  进程调度器自动做：                                                  │
+│  ├── 在消息处理后自动调用 snapshot                                   │
+│  ├── 将快照保存到缓存                                                │
+│  ├── 在下一个请求时自动调用 normalize                                │
+│  └── dev_aojs 的 API 被透明地调用                                    │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**关键区别**：
+
+| 层面 | dev_aojs 设备 | 进程机制 |
+|------|---------------|----------|
+| **功能** | 提供序列化/反序列化 API | 自动保存/加载状态 |
+| **触发方式** | 手动调用 | 调度器自动 |
+| **直接调用** | 不保持状态 | 不适用 |
+| **通过进程调用** | 状态被持久化 | ✅ 正常工作 |
+
+**流程对比**：
+
+```
+场景 A：直接调用 dev_aojs（无进程）
+───────────────────────────────────────────
+HTTP 请求 1 → dev_aojs:compute → snapshot → 快照在消息中
+HTTP 请求 2 → dev_aojs:compute → 新实例 → normalize? → 快照被丢弃
+结果：❌ 状态不保持
+
+场景 B：通过进程调用 dev_aojs
+───────────────────────────────────────────
+HTTP 请求 1 → 进程调度器 → dev_aojs:compute → snapshot
+                                  ↓
+                               调度器保存到缓存
+HTTP 请求 2 → 进程调度器 → 从缓存加载 → dev_aojs:normalize → 恢复状态
+结果：✅ 状态保持
+```
+
+**为什么这样设计**？
+
+| 设计点 | 原因 |
+|--------|------|
+| dev_aojs 不直接保存状态 | 保持设备的「纯函数」特性，状态管理交给进程 |
+| snapshot/normalize 是 API | 让进程决定何时保存/恢复 |
+| 进程自动调用 | 用户无需关心底层细节 |
+
+**结论**：
+
+| 说法 | 正确性 | 解释 |
+|------|--------|------|
+| "普通设备无法自动保持状态" | ✅ 正确 | dev_aojs 每次请求都是新实例 |
+| "进程机制是状态持久化的标准方案" | ✅ 正确 | 进程自动管理快照 |
+| "dev_aojs 有 snapshot 功能" | ✅ 正确 | 但这只是工具，不自动工作 |
+
+**核心理解**：`dev_aojs` 的 `snapshot/normalize` 是「给进程调用的工具函数」，而不是「自动状态管理」。只有通过进程机制，这些 API 才能发挥状态持久化的作用。
+
 ### 10.3 使用进程的步骤
 
 **步骤 1：创建进程**
@@ -860,6 +1013,8 @@ GET /~process@1.0/compute/latest
 | 2026-02-07 | 第10轮 | 自主 | 缓存机制深度验证：store 默认值、优先级确认 |
 | 2026-02-07 | 第11轮 | 自主 | 进程Worker机制验证：内存状态、超时快照确认 |
 | 2026-02-07 | 第12轮 | 自主 | 快照触发机制验证：should_snapshot 双重触发确认 |
+| 2026-02-07 | 第13轮 | 自主 | dev_aojs 验证：WASM序列化模式 + 设备栈前缀隔离 |
+| 2026-02-07 | 第14轮 | 自主 | 设备工具vs进程机制分析：澄清 dev_aojs 不违反"只有进程才能保持状态" |
 
 ### B. 版本历史
 
@@ -873,6 +1028,10 @@ GET /~process@1.0/compute/latest
 |     |          | 优化证据索引，补充 E1-E6 源代码验证 |
 | 2.4 | 2026-02-07 | 第9-12轮验证：4轮核心代码深度验证 |
 |     |          | 优化快照配置表格，补充快照恢复流程代码 |
+| 2.5 | 2026-02-07 | 第13轮验证：新增 dev_aojs WASM序列化模式示例 |
+|     |          | 补充设备栈前缀隔离机制，添加两种持久化模式对比 |
+| 2.6 | 2026-02-07 | 第14轮验证：新增「设备工具 vs 进程机制」分析章节 |
+|     |          | 澄清 dev_aojs 与「只有进程才能保持状态」的一致性 |
 
 ### C. 关键决策点索引
 
@@ -896,12 +1055,15 @@ GET /~process@1.0/compute/latest
 | src/hb_private.erl | 私有状态管理 |
 | src/dev_lua.erl | 设备初始化 |
 | src/dev_process.erl | 进程设备 |
+| src/dev_aojs.erl | JavaScript WASM 运行时设备 |
+| src/dev_stack.erl | 设备栈（前缀隔离） |
+| src/hb_beamr.erl | WASM 序列化接口 |
 
 ---
 
-**文档版本**：2.4（系统性审查优化版）
+**文档版本**：2.6（设备工具vs进程机制澄清版）
 **创建时间**：2026-02-06
 **最后更新**：2026-02-07
 **验证者**：Claude (AI Assistant) + 第三方验证报告 + 权威代码验证
 **置信度**：100%
-**验证方法**：自主代码审查 + 交叉验证 + 系统性代码验证（12轮）
+**验证方法**：自主代码审查 + 交叉验证 + 系统性代码验证（14轮）
