@@ -114,18 +114,36 @@ Spawn请求
 **通过AOS配置**：
 
 ```lua
--- 在AOS中spawn时指定设备栈
+-- 在AOS中spawn时指定设备栈（数组格式）
 ao.spawn(module_id, {
     Data = boot_script,
     Tags = {
         {name = "Execution-Device", value = "stack@1.0"},
-        {name = "Device-Stack-1", value = "dedup@1.0"},
-        {name = "Device-Stack-2", value = "lua@5.3a"},
-        {name = "Device-Stack-3", value = "cron@1.0"},
+        {name = "Device-Stack", value = json.encode({
+            "dedup@1.0", "lua@5.3a", "cron@1.0"
+        })},
+        {name = "Stack-Mode", value = "Fold"}
+    }
+})
+
+-- 也可以使用Map格式
+ao.spawn(module_id, {
+    Data = boot_script,
+    Tags = {
+        {name = "Execution-Device", value = "stack@1.0"},
+        {name = "Device-Stack", value = json.encode({
+            ["1"] = "dedup@1.0",
+            ["2"] = "lua@5.3a",
+            ["3"] = "cron@1.0"
+        })},
         {name = "Stack-Mode", value = "Fold"}
     }
 })
 ```
+
+**说明**：
+- AOS/Lua中 `Device-Stack` 需要JSON编码
+- 推荐使用数组格式，更简洁
 
 **通过aoconnect SDK配置**：
 
@@ -148,10 +166,10 @@ const processId = await request({
   // 完整的设备配置
   'execution-device': 'stack@1.0',
   'device-stack': [
-    'dedup@1.0',      -- 去重处理
-    'cron@1.0',       -- 调度支持
-    'lua@5.3a',       -- Lua执行
-    'multipass@1.0'   -- 多通道
+    'dedup@1.0',      // 去重处理
+    'cron@1.0',       // 调度支持
+    'lua@5.3a',       // Lua执行
+    'multipass@1.0'   // 多通道
   ],
   data: 'print("Process initialized")'
 })
@@ -217,11 +235,57 @@ await message({
 - `hb_ao:resolve`函数中，`Msg2`只提供路径，不提供设备配置
 - 设备配置必须在进程创建时写入进程的Tags
 
-### 3.3 SDK初始化配置
+### 3.3 Variant与默认设备
+
+**Variant的作用**：`process/variant` 键决定进程的默认执行设备。
+
+**Variant与设备配置的关系**（dev_process.erl:140-148）：
+```erlang
+default_device(Msg1, Key, Opts) ->
+    NormKey = hb_ao:normalize_key(Key),
+    case {NormKey, hb_util:deep_get(<<"process/variant">>, Msg1, Opts)} of
+        {<<"execution">>, <<"ao.TN.1">>} -> <<"genesis-wasm@1.0">>;  % HyperBEAM
+        _ -> default_device_index(NormKey)  % 回退到系统默认
+    end.
+```
+
+**Variant取值**：
+| Variant | 默认执行设备 | 说明 |
+|---------|-------------|------|
+| `ao.TN.1` | `genesis-wasm@1.0` | HyperBEAM（推荐） |
+| `ao.N.1` | 需要显式配置 | Legacy Net，需指定execution-device |
+| 未设置 | 需要显式配置 | 需指定execution-device |
+
+**Spawn时指定Variant**：
+```javascript
+// Spawn时指定Variant为ao.TN.1（HyperBEAM）
+await request({
+  path: '/push',
+  method: 'POST',
+  type: 'Process',
+  scheduler: schedulerAddress,
+  module: moduleId,
+
+  'Variant': 'ao.TN.1',  // HyperBEAM变体
+  'execution-device': 'stack@1.0',
+  'device-stack': ['dedup@1.0', 'lua@5.3a'],
+
+  data: bootScript
+})
+```
+
+**说明**：
+- `ao.TN.1` 是推荐变体，默认使用 `genesis-wasm@1.0` 执行引擎
+- Legacy Net（`ao.N.1`）或其他变体需要显式配置 `execution-device`
+- Variant通过 `Variant` Tag在Spawn时设置
+
+### 3.4 SDK初始化配置
 
 aoconnect SDK在初始化时可以指定默认设备路径：
 
 ```javascript
+import { connectWith } from '@permaweb/aoconnect'
+
 const connect = connectWith({
   createDataItemSigner: WalletClient.createSigner,
   createSigner: WalletClient.createSigner
@@ -231,10 +295,14 @@ const connect = connectWith({
 const { request } = connect({
   MODE: 'mainnet',
   URL: 'https://cu.ao-testnet.xyz',
-  device: 'process@1.0',  // 默认设备路径
+  device: 'process@1.0',  // 默认设备路径（可选：'relay@1.0'）
   signer: createSigner(WALLET)
 })
 ```
+
+**说明**：
+- `device` 参数指定默认消息路由路径，不是进程的设备配置
+- 进程的设备配置（`Execution-Device`、`Device-Stack-*`）需要在Spawn请求的Tags中指定
 
 ---
 
@@ -331,28 +399,35 @@ resolve(Msg1, Msg2, Opts) ->
 
 从Tags中提取设备栈配置并组装成完整的处理管道：
 
-**示例配置解析**：
+**Tags格式（数组或Map均支持）**：
 
-```
-假设进程的Tags包含：
+```json
+// 数组格式（推荐）
 {
   "Execution-Device": "stack@1.0",
-  "Device-Stack-1": "dedup@1.0",
-  "Device-Stack-2": "lua@5.3a",
-  "Device-Stack-3": "cron@1.0"
+  "Device-Stack": ["dedup@1.0", "lua@5.3a", "cron@1.0"]
 }
 
-解析后的设备栈：
+// Map格式
 {
-  "device": "stack@1.0",
-  "device-stack": {
+  "Execution-Device": "stack@1.0",
+  "Device-Stack": {
     "1": "dedup@1.0",
-    "2": "lua@5.3a", 
+    "2": "lua@5.3a",
     "3": "cron@1.0"
-  },
-  "mode": "Fold"
+  }
 }
 ```
+
+**Tags解析与自动转换**：
+- Tags数组解析后转换为消息Map
+- `hb_ao:normalize_keys` 会自动将数组转换为索引Map：
+  ```erlang
+  ["dedup@1.0", "lua@5.3a"]
+  %% 自动转换为：
+  #{ <<"1">> => <<"dedup@1.0">>, <<"2">> => <<"lua@5.3a">> }
+  ```
+- transform函数使用索引键（如 `<<"1">>`, `<<"2">>`）查找设备
 
 **设备栈执行**（dev_stack.erl）：
 
@@ -676,11 +751,11 @@ const processInfo = await request({
 })
 
 // 检查关键配置
-const execDevice = processInfo.Tags?.find(t => t.name === 'execution-device')
-const deviceStack = processInfo.Tags?.filter(t => t.name.startsWith('device-stack'))
+const execDevice = processInfo.Tags?.find(t => t.name === 'Execution-Device')
+const deviceStack = processInfo.Tags?.find(t => t.name === 'Device-Stack')
 
 console.log('Execution Device:', execDevice?.value)
-console.log('Device Stack:', deviceStack)
+console.log('Device Stack:', deviceStack?.value)
 ```
 
 ### 8.4 避免常见错误
@@ -774,7 +849,64 @@ console.log('Device Stack:', deviceStack)
 ]
 ```
 
-### 9.3 设备间状态传递失败
+### 9.3 设备配置未正确写入Tags
+
+**问题描述**：Spawn时配置了设备，但后续消息未使用
+
+**根本原因**：Tags中的设备配置名称必须符合规范
+
+**解决方案**：
+使用标准的Tag命名格式（注意大小写）：
+
+```javascript
+// Spawn时正确配置设备
+await request({
+  path: '/push',
+  method: 'POST',
+  type: 'Process',
+  scheduler: address,
+  module: moduleId,
+
+  // Tags格式：首字母大写（Arweave Tags规范）
+  'Execution-Device': 'stack@1.0',
+  'Device-Stack': ['dedup@1.0', 'lua@5.3a', 'cron@1.0'],
+
+  data: bootScript
+})
+
+// 验证配置
+const processInfo = await request({
+  path: `/process/${pid}`
+})
+
+// 检查Tags是否存在
+const execDeviceTag = processInfo.Tags.find(t => t.name === 'Execution-Device')
+const deviceStackTag = processInfo.Tags.find(t => t.name === 'Device-Stack')
+console.log('Execution-Device:', execDeviceTag?.value)
+console.log('Device-Stack:', deviceStackTag?.value)
+```
+
+**Tags解析原理**：
+```erlang
+%% Tags数组 → Map转换（dev_json_iface.erl:412-423）
+tags_to_map(Msg, Opts) ->
+    RawTags = hb_maps:get(<<"tags">>, NormMsg, [], Opts),
+    TagList =
+        [
+            {hb_maps:get(<<"name">>, Tag, Opts), hb_maps:get(<<"value">>, Tag, Opts)}
+        ||
+            Tag <- RawTags
+        ],
+    hb_maps:from_list(TagList).
+    %% 最终：#{ <<"Execution-Device">> => <<"stack@1.0">>, ... }
+```
+
+**关键点**：
+1. Tags格式是 `[{name, value}, ...]` 数组
+2. 设备配置Tag名称：**首字母大写**（Arweave规范）
+3. 解析后可通过 `hb_maps:get(<<"Execution-Device">>, Msg, Opts)` 访问
+
+### 9.4 设备间状态传递失败
 
 **问题描述**：设备栈中前一个设备的状态没有传递给后一个设备
 
@@ -806,12 +938,17 @@ console.log('Device Stack:', deviceStack)
 
 | 参数名 | 类型 | 必需 | 描述 |
 |--------|------|------|------|
-| execution-device | string | 是 | 执行设备标识 |
-| device-stack | array | 是 | 设备栈列表 |
+| Variant | string | 否 | 进程变体（`ao.TN.1` 推荐，`ao.N.1` Legacy） |
+| execution-device | string | 条件必需* | 执行设备标识 |
+| device-stack | array/object | 条件必需* | 设备栈列表 |
 | scheduler-device | string | 否 | 调度设备（默认scheduler@1.0） |
 | push-device | string | 否 | 推送设备（默认push@1.0） |
 | stack-mode | string | 否 | 执行模式（默认Fold） |
 | stack-keys | array | 否 | 设备栈响应的键列表 |
+
+**说明**：
+- `execution-device` 和 `device-stack` 对于 `ao.TN.1` Variant是可选的（使用默认设备）
+- 对于 `ao.N.1` 或未设置 Variant，这些参数是必需的
 
 ### B. 可用设备参考
 
