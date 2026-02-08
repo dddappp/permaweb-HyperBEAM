@@ -390,6 +390,37 @@ resolve_fold(Message1, Message2, DevNum, Opts) ->
 
 **说明**：数组格式会被 `hb_ao:normalize_keys` 自动转换为索引Map
 
+### 3.3 设备栈元数据（官方文档补充）
+
+根据官方文档 `dev_stack.erl` 的完整定义，设备栈在执行过程中会添加以下元数据键：
+
+```erlang
+%% 设备栈元数据键（来自 dev_stack.erl:52-76）
+<<"Stack-Pass">>      %% 重置执行的次数（从1开始计数）
+<<"Input-Prefix">>     %% 设备输入输出的前缀
+<<"Output-Prefix">>   %% 前一个执行的设备
+<<"device-key">>       %% 当前执行的设备编号
+<<"device-stack-previous">>  %% 之前执行的设备
+```
+
+#### 可配置的运行选项
+
+设备栈还支持以下运行选项（通过 Msg1 或 Msg2 设置）：
+
+```erlang
+<<"Error-Strategy">>   %% 错误处理策略：stop 或 throw
+<<"Allow-Multipass">>   %% 是否允许自动 multipass（布尔值）
+<<"Mode">>              %% 执行模式：Fold 或 Map（Msg2 优先于 Msg1）
+```
+
+**代码证据**（dev_stack.erl:52-76）：
+
+> The dev_stack adds additional metadata to the message in order to track the state of its execution as it progresses through devices.
+>
+> - `Stack-Pass`: The number of times the stack has reset and re-executed from the first device for the current message.
+> - `Input-Prefix`: The prefix that the device should use for its outputs and inputs.
+> - `Output-Prefix`: The device that was previously executed.
+
 ---
 
 ## 四、特殊控制机制

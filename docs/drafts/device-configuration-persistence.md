@@ -156,7 +156,7 @@ ao.spawn(module_id, {
         {name = "Device-Stack", value = json.encode({
             "dedup@1.0", "lua@5.3a", "cron@1.0"
         })},
-        {name = "Stack-Mode", value = "Fold"}
+        {name = "Mode", value = "Fold"}
     }
 })
 
@@ -170,7 +170,7 @@ ao.spawn(module_id, {
             ["2"] = "lua@5.3a",
             ["3"] = "cron@1.0"
         })},
-        {name = "Stack-Mode", value = "Fold"}
+        {name = "Mode", value = "Fold"}
     }
 })
 ```
@@ -300,7 +300,7 @@ await request({
   scheduler: schedulerAddress,
   module: moduleId,
 
-  'Variant': 'ao.TN.1',  // HyperBEAM变体
+  'variant': 'ao.TN.1',  // HyperBEAM变体
   'execution-device': 'stack@1.0',
   'device-stack': ['dedup@1.0', 'lua@5.3a'],
 
@@ -616,7 +616,7 @@ const processId = await spawn({
         { name: "Execution-Device", value: "stack@1.0" },
         { name: "Scheduler-Device", value: "scheduler@1.0" },
         { name: "Device-Stack", value: "wasm-64@1.0,aojs@1.0" },
-        { name: "Stack-Keys", value: "init,compute,snapshot,normalize" }
+        { name: "stack-keys", value: "init,compute,snapshot,normalize" }
     ]
 });
 ```
@@ -875,7 +875,7 @@ await request({
     'cron@1.0',        // 推荐：调度支持
     'lua@5.3a'         // 执行引擎
   ],
-  'stack-mode': 'Fold',
+  'mode': 'Fold',
   'stack-keys': ['compute', 'init', 'snapshot']
 })
 
@@ -1126,7 +1126,7 @@ tags_to_map(Msg, Opts) ->
 | device-stack | array/object | 条件必需* | 设备栈列表 |
 | scheduler-device | string | 否 | 调度设备（默认scheduler@1.0） |
 | push-device | string | 否 | 推送设备（默认push@1.0） |
-| stack-mode | string | 否 | 执行模式（默认Fold） |
+| mode | string | 否 | 执行模式（默认Fold） |
 | stack-keys | array | 否 | 设备栈响应的键列表 |
 
 **说明**：
