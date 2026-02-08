@@ -4,6 +4,40 @@
 > **分析深度**：源码级验证  
 > **核心主题**：AO设备配置机制、持续生效原理、最佳实践
 
+## 重要术语澄清
+
+在阅读本文档之前，请务必理解以下三个关键概念的**区别**：
+
+| 术语 | 含义 | 在代码中的形式 | 示例 |
+|------|------|----------------|------|
+| **device**（设备） | 任意设备模块的通用称呼 | 模块名或消息字段 | `<<"lua@5.3a">>` 或 `<<"device">>`字段 |
+| **execution-device** | 进程配置项，指定哪个设备负责处理消息执行 | 进程Tags中的键 | `<<"execution-device">>` = `<<"stack@1.0">>` |
+| **device-stack** | 进程配置项，指定要按顺序执行的所有设备列表 | 进程Tags中的键 | `<<"device-stack">>` = `[<<"dedup@1.0">>, <<"lua@5.3a">>]` |
+
+**关键区分**：
+- `execution-device` 和 `device-stack` 是**进程级别**的配置，存储在 Arweave 消息的 Tags 中
+- `device` 是**通用术语**，既可以指设备模块本身，也可以指消息中标识当前执行设备的字段
+
+**示例**：
+```json
+{
+  "Tags": {
+    "execution-device": "stack@1.0",     ← 进程配置：指定执行协调者
+    "device-stack": [                    ← 进程配置：指定要执行的设备列表
+      "dedup@1.0",
+      "lua@5.3a"
+    ]
+  }
+}
+```
+
+在消息处理过程中，`<<"device">>` 字段会动态变化，表示当前正在执行的设备：
+```erlang
+%% Msg3 中的 <<"device">> 字段会随执行进度变化
+<<"device">> => <<"dedup@1.0">>,  ← 当前正在执行 dedup 设备
+<<"device">> => <<"lua@5.3a">>,   ← 当前正在执行 lua 设备
+```
+
 ## 概述
 
 本文档系统化阐述AO（Always-On）网络中"设备"（Device）的配置机制，涵盖从基础概念到实际应用的完整知识体系。通过对AOS、AOCONNECT SDK和HyperBEAM三个核心代码库的深入分析，为开发者提供设备配置的理论基础和实践指南。
@@ -301,8 +335,9 @@ const { request } = connect({
 ```
 
 **说明**：
-- `device` 参数指定默认消息路由路径，不是进程的设备配置
-- 进程的设备配置（`Execution-Device`、`Device-Stack-*`）需要在Spawn请求的Tags中指定
+- `device` 参数（AOCONNECT SDK）指定**默认消息路由路径**，不是进程的设备配置
+- 进程的设备配置（`Execution-Device`、`Device-Stack`）需要在 Spawn 请求的 Tags 中指定
+- **关键区分**：SDK 的 `device` 与消息中的 `<<"device">>` 字段是不同的概念
 
 ---
 
@@ -402,13 +437,13 @@ resolve(Msg1, Msg2, Opts) ->
 **Tags格式（数组或Map均支持）**：
 
 ```json
-// 数组格式（推荐）
+/* 数组格式（推荐） */
 {
   "Execution-Device": "stack@1.0",
   "Device-Stack": ["dedup@1.0", "lua@5.3a", "cron@1.0"]
 }
 
-// Map格式
+/* Map格式 */
 {
   "Execution-Device": "stack@1.0",
   "Device-Stack": {
@@ -445,6 +480,155 @@ resolve_fold(Message1, Message2, Opts) ->
     end.
 ```
 
+### 4.4 设备配置的两层机制：节点级别与进程级别
+
+**核心发现**：设备配置分为**两个独立层级**，两者缺一不可！
+
+#### 4.4.1 两层配置概览
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     第一层：节点配置 (hb_opts.erl)                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  位置：src/hb_opts.erl:130-184                                         │
+│  作用：告诉 HyperBEAM 节点"我信任这些设备模块"                           │
+│                                                                         │
+│  preloaded_devices => [                                                │
+│      #{<<"name">> => <<"lua@5.3a">>, <<"module">> => dev_lua},         │
+│      #{<<"name">> => <<"stack@1.0">>, <<"module">> => dev_stack},      │
+│      ...                                                               │
+│  ]                                                                     │
+│                                                                         │
+│  ⚠️ 重要发现：dev_aojs 不在默认的 preloaded_devices 列表中！              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    第二层：进程配置 (Spawn Tags)                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  位置：Spawn 请求的 Tags                                                │
+│  作用：告诉进程"执行时请使用这些设备"                                    │
+│                                                                         │
+│  tags: [                                                               │
+│      { name: "Execution-Device", value: "stack@1.0" },                 │
+│      { name: "Device-Stack", value: "wasm-64@1.0,aojs@1.0" }           │
+│  ]                                                                     │
+│                                                                         │
+│  代码证据（dev_process.erl:700-707）：                                   │
+│  ```erlang                                                               │
+│  hb_maps:get(<< Key/binary, "-device">>,  %% 例如: "execution-device"  │
+│      Msg1,                                       %% ← 从 Msg1 读取     │
+│      default_device(Msg1, Key, Opts),                                │
+│      Opts)                                                            │
+│  ```                                                                    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 4.4.2 设备加载流程（源码验证）
+
+**hb_ao_device.erl:307-319** - 设备加载逻辑：
+
+```erlang
+load(ID, Opts) when ?IS_ID(ID) ->
+    %% 从 Arweave 加载设备（需要 load_remote_devices = true）
+    ... (略) ...
+
+load(ID, Opts) ->
+    NormKey = hb_ao:normalize_key(ID),
+    case lists:search(
+        fun (#{ <<"name">> := Name }) -> Name =:= NormKey end,
+        Preloaded = hb_opts:get(preloaded_devices, [], Opts)  %% ← 检查白名单
+    ) of
+        false -> {error, {module_not_admissable, NormKey, Preloaded}};
+        {value, #{ <<"module">> := Mod }} -> load(Mod, Opts)
+    end.
+```
+
+**结论**：
+- 如果设备名 **不在** `preloaded_devices` 中 → 返回 `{error, {module_not_admissable, ...}}`
+- 如果设备名 **在** `preloaded_devices` 中 → 加载对应的模块
+
+#### 4.4.3 设备选择流程（源码验证）
+
+**dev_process.erl:700-707** - 运行时设备选择：
+
+```erlang
+PreparedMsg =
+    hb_util:deep_merge(
+        ensure_process_key(Msg1, Opts),
+        #{
+            <<"device">> =>
+                DeviceSet =
+                    hb_maps:get(
+                        << Key/binary, "-device">>,  %% 例如: "execution-device"
+                        Msg1,                         %% ← 从 Msg1（Spawn消息）读取
+                        default_device(Msg1, Key, Opts),
+                        Opts
+                    )
+        },
+        Opts
+    )
+```
+
+**dev_stack.erl:198** - 设备栈读取：
+
+```erlang
+case hb_ao:get(<<"device-stack">>, {as, dev_message, Msg1}, Opts) of
+    not_found -> throw({error, no_valid_device_stack});
+    StackMsg -> ...
+end
+```
+
+**结论**：
+- `<<"execution-device">>` 从 `Msg1`（Spawn消息）读取
+- `<<"device-stack">>` 从 `Msg1`（Spawn消息）读取
+- `Msg1` 包含 Spawn 时配置的 Tags
+
+#### 4.4.4 实际应用：以 dev_aojs 为例
+
+**问题**：本地运行 HyperBEAM 节点，能否直接使用 `dev_aojs`？
+
+**答案**：需要两层配置！
+
+```erlang
+%% === 第一层：修改 hb_opts.erl，添加 aojs@1.0 ===
+
+preloaded_devices => [
+    %% ... 其他设备
+    #{<<"name">> => <<"aojs@1.0">>, <<"module">> => dev_aojs},  %% ← 必须添加！
+    #{<<"name">> => <<"counter@1.0">>, <<"module">> => dev_counter}
+]
+```
+
+```javascript
+// === 第二层：Spawn 进程时配置 Tags ===
+
+const processId = await spawn({
+    module: WASM_MODULE_TX_ID,
+    scheduler: SCHEDULER,
+    signer: createSigner(wallet),
+    tags: [
+        { name: "Type", value: "Process" },
+        // --- 设备配置 ---
+        { name: "Execution-Device", value: "stack@1.0" },
+        { name: "Scheduler-Device", value: "scheduler@1.0" },
+        { name: "Device-Stack", value: "wasm-64@1.0,aojs@1.0" },
+        { name: "Stack-Keys", value: "init,compute,snapshot,normalize" }
+    ]
+});
+```
+
+#### 4.4.5 常见错误排查
+
+| 错误信息 | 原因 | 解决方案 |
+|----------|------|----------|
+| `{module_not_admissable, aojs@1.0}` | `aojs@1.0` 不在 `preloaded_devices` | 修改 `hb_opts.erl` 添加设备 |
+| `no_valid_device_stack` | `Device-Stack` 未配置 | Spawn 时添加 Tags |
+| 设备未执行 | 设备不在 `Device-Stack` 列表中 | 检查 Tags 配置 |
+
 ---
 
 ## 第五章：HyperBEAM设备栈深度解析
@@ -469,21 +653,20 @@ HyperBEAM中的设备栈由`dev_stack`模块实现，提供两种执行模式：
 
 ```erlang
 #{
-    <<"device">> => <<"stack@1.0">>,           -- 标识这是设备栈
-    <<"mode">> => <<"Fold">>,                -- 执行模式
-    <<"device-stack">> => #{
-        <<"1">> => <<"dedup@1.0">>,         -- 第一个设备
-        <<"2">> => <<"cron@1.0">>,          -- 第二个设备
-        <<"3">> => <<"lua@5.3a">>,           -- 第三个设备
-        <<"4">> => <<"multipass@1.0">>      -- 第四个设备
-    },
-    <<"stack-keys">> => [                    -- 设备栈响应的键
-        <<"compute">>,
-        <<"init">>,
-        <<"snapshot">>
+    <<"execution-device">> => <<"stack@1.0">>,  -- ← 配置项：指定执行协调者为 stack@1.0
+    <<"mode">> => <<"Fold">>,                 -- 执行模式
+    <<"device-stack">> => [                  -- ← 配置项：指定要执行的设备列表
+        <<"dedup@1.0">>,                    -- 第一个设备
+        <<"cron@1.0">>,                     -- 第二个设备
+        <<"lua@5.3a">>,                      -- 第三个设备
+        <<"multipass@1.0">>                 -- 第四个设备
     ]
 }
 ```
+
+> **⚠️ 重要区分**：
+> - `<<"execution-device">>` = `<<"stack@1.0">>` 是**配置项**，在 Spawn 时设置
+> - `<<"device">>` 是**运行时字段**，在消息处理过程中动态变化，标识当前正在执行的设备
 
 ### 5.3 设备栈的标准执行流程
 
