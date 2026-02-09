@@ -33,9 +33,217 @@
 <<"device">> => <<"lua@5.3a">>,     ← 当前正在执行 lua
 ```
 
-## 一、核心问题解答
+## 零、设备接口约束：弱约束设计
 
-### 1.1 问题陈述
+在讨论设备协作之前，必须先理解一个关键问题：**AO设备有任何必须实现的接口吗？**
+
+**答案：没有任何函数是必须实现的！**
+
+### 弱约束设计原理
+
+**核心机制**（`hb_ao_device.erl`）：
+
+```erlang
+%% 如果没有 info 映射（Info 不是 map），默认所有函数都导出
+is_exported(_Info, _Key, _Opts) -> true;
+
+%% info 函数是唯一特殊的：如果存在，总是会被识别
+is_exported(_, info, _Opts) -> true;
+is_exported(_Msg, _Dev, info, _Opts) -> true;
+
+%% 如果有 info 映射，检查 exports 和 excludes
+is_exported(Info = #{ excludes := Excludes }, Key, Opts) -> ...;
+is_exported(#{ exports := Exports }, Key, _Opts) -> ...;
+```
+
+**代码解读**：
+
+| 规则 | 含义 |
+|------|------|
+| `is_exported(_Info, _Key, _Opts) -> true` | 如果没有 info 映射，**所有函数默认导出** |
+| `is_exported(_, info, _Opts) -> true` | info 函数**始终**被认为已导出 |
+| `is_exported(#{ exports := Exports }, ...)` | 有 info 映射时，从 `exports` 列表检查 |
+| `is_exported(#{ excludes := Excludes }, ...)` | 有 excludes 列表时，排除指定函数 |
+
+**工作流程**：
+1. 系统通过 `hb_ao_device:find_exported_function/5` **动态查找**设备是否实现了某个函数
+2. 如果设备没有某函数，系统会**静默跳过**或使用默认设备处理
+3. 函数不存在时**不会报错**
+4. `info` 函数是**唯一特殊**的——如果存在，总是被识别
+
+### 设备接口是"按需实现"的
+
+**不同设备的常见函数**（不是必须，是常见）：
+
+| 设备类型 | 示例设备 | 常见函数 |
+|----------|----------|----------|
+| 执行设备 | `dev_aojs`, `dev_wasm` | `compute/3`, `init/3`, `snapshot/3`, `normalize/3` |
+| Codec | `dev_codec_json` | `to/3`, `from/3`, `commit/3`, `verify/3` |
+| Cron | `dev_cron` | `once/3`, `every/3`, `stop/3` |
+| Cache | `dev_cache` | `read/3`, `write/3`, `link/3` |
+| Counter | `dev_counter` | `info/3`, `value/3`, `increment/3` |
+
+**示例证据**：
+
+```erlang
+%% dev_cache.erl - 只有3个函数
+-export([read/3, write/3, link/3]).
+
+%% dev_cron.erl - 只有5个函数
+-export([once/3, every/3, stop/3, info/1, info/3]).
+
+%% dev_json_iface.erl - 只有2个主要函数
+-export([init/3, compute/3]).
+```
+
+### 关键理解
+
+1. **设备选择器**：`<<"device">>` 字段指定使用哪个设备模块
+2. **函数动态查找**：系统按需查找，不强制实现
+3. **静默跳过**：函数不存在时不会报错
+4. **按需实现**：只需要实现你需要的功能
+
+### 这与设备协作有什么关系？
+
+正是因为这种**弱约束设计**，`dev_stack` 才能作为统一协调者：
+- 它不关心设备具体实现了哪些函数
+- 它只负责按顺序调用和传递返回值
+- 设备只需要关注自己的业务逻辑
+
+---
+
+## 一、设备执行流程概述
+
+理解设备协作的第一步，是理解**整个 AO 消息处理的执行流程**。
+
+### 1.1 核心解析器：`hb_ao:resolve`
+
+`hb_ao:resolve` 是 AO 系统的**顶层入口函数**，所有消息解析都从这里开始：
+
+```erlang
+%% hb_ao.erl:110-114
+%% @doc Get the value of a message's key by running its associated device
+%% function. Returns `{ok | error, NewMessage}'.
+resolve(Msg1, Msg2, Opts) ->
+    ...
+```
+
+**它由 13 个阶段组成**（hb_ao.erl:114-126）：
+
+| 阶段 | 名称 | 说明 |
+|------|------|------|
+| 1 | Normalization | 归一化消息格式 |
+| 2 | Cache lookup | 缓存查找，命中则直接返回 |
+| 3 | Validation check | 消息有效性验证 |
+| 4 | Persistent-resolver lookup | 持久化解析器查找（防止重复执行） |
+| 5 | **Device lookup** | **确定使用哪个设备** |
+| 6 | **Execution** | **执行设备函数** |
+| 7 | Step hook | 执行 step 钩子 |
+| 8 | Subresolution | 子解析（嵌套消息处理） |
+| 9 | Cryptographic linking | 更新 HashPath |
+| 10 | Result caching | 缓存结果 |
+| 11 | Notify waiters | 通知等待者 |
+| 12 | Fork worker | 分叉工作线程 |
+| 13 | Recurse or terminate | 递归或终止 |
+
+### 1.2 设备选择机制
+
+**核心问题**：hb_ao:resolve 如何知道调用哪个设备？
+
+**答案**：由消息中的 `<<"device">>` 字段决定！
+
+```erlang
+%% hb_ao_device.erl:125-129
+message_to_device(Msg, Opts) ->
+    case dev_message:get(<<"device">>, Msg, Opts) of
+        {error, not_found} ->
+            default();  %% ← 未设置时使用默认设备
+        {ok, DevID} ->
+            case load(DevID, Opts) of
+                {ok, DevMod} -> DevMod
+            end
+    end.
+
+default() -> dev_message.  %% 默认设备是 dev_message
+```
+
+### 1.3 直接调用 vs 容器调用
+
+AO 中的设备调用分为两种模式：
+
+**模式 A：直接调用**
+```
+hb_ao:resolve (阶段 1-13)
+    └── 直接调用设备（如 dev_cache）
+```
+
+**模式 B：容器调用（dev_stack）**
+```
+hb_ao:resolve (阶段 1-5)
+    └── dev_stack (阶段 6)
+            └── hb_ao:resolve (子调用，阶段 1-13)
+                    └── dedup@1.0
+            └── hb_ao:resolve (子调用，阶段 1-13)
+                    └── cron@1.0
+            └── hb_ao:resolve (子调用，阶段 1-13)
+                    └── lua@5.3a
+```
+
+### 1.4 设备分类
+
+| 设备类型 | 示例 | 角色 | 调用方式 |
+|----------|------|------|----------|
+| **根解析器** | `hb_ao:resolve` | 顶层入口，管理 13 个阶段 | 系统内置 |
+| **默认设备** | `dev_message` | 提供消息基本操作（get/set/id 等） | 直接调用 |
+| **执行设备** | `dev_aojs`, `dev_lua` | 执行业务逻辑 | 直接调用 |
+| **辅助设备** | `dev_cache`, `dev_dedup` | 提供通用功能 | 直接调用 |
+| **容器设备** | `dev_stack` | 包含并管理多个子设备 | 内部递归调用 |
+
+### 1.5 device 字段的来源
+
+`<<"device">>` 字段可以从以下几个来源设置：
+
+| 来源 | 说明 | 示例 |
+|------|------|------|
+| **进程初始化** | Spawn 时配置 | `Msg1.<<"device">> = <<"stack@1.0">>` |
+| **设备变换** | dev_stack 的 transform | `device=dedup@1.0` |
+| **子解析** | `{as, DevID, Msg}` 语法 | 切换到 `dev_cache` |
+| **HTTP 路径** | 解析请求路径 | `/~aojs@1.0/compute` |
+
+### 1.6 典型调用链示例
+
+**示例 A：直接调用 dev_cache**
+```
+HTTP: GET /~cache@1.0/read?target=xxx
+    ↓
+Msg2.<<"device">> = <<"cache@1.0">>
+    ↓
+hb_ao:resolve(Msg1, Msg2)
+    ↓ (阶段 5-6)
+直接调用 → dev_cache:read/3
+```
+
+**示例 B：通过 dev_stack 调用**
+```
+HTTP: POST /~stack@1.0/compute (带 lua 模块)
+    ↓
+Msg2.<<"device">> = <<"stack@1.0">>
+    ↓
+hb_ao:resolve(Msg1, Msg2)
+    ↓ (阶段 5-6)
+调用 → dev_stack
+    ↓ dev_stack 内部循环：
+    ├── transform → device=dedup@1.0 → hb_ao:resolve → dedup
+    ├── transform → device=cron@1.0 → hb_ao:resolve → cron
+    ├── transform → device=lua@5.3a → hb_ao:resolve → lua
+    └── transform → device=multipass@1.0 → hb_ao:resolve → multipass
+```
+
+---
+
+## 二、核心问题解答
+
+### 2.1 问题陈述
 
 当一个进程使用设备栈（Device Stack）时，例如：
 ```
@@ -48,7 +256,7 @@ dedup@1.0 → cron@1.0 → lua@5.3a → multipass@1.0
 - 有没有"统一的协调者"？
 - 还是每个设备有不同的协作方式？
 
-### 1.2 核心答案
+### 2.2 核心答案
 
 **是的，存在统一的协调者——`dev_stack`模块**。所有设备栈的协作都由`dev_stack`集中管理：
 
@@ -112,9 +320,9 @@ dedup@1.0 → cron@1.0 → lua@5.3a → multipass@1.0
 
 ---
 
-## 二、设备协作的完整流程
+## 三、设备协作的完整流程
 
-### 2.1 执行流程图
+### 3.1 执行流程图
 
 ```
 用户消息
@@ -171,7 +379,7 @@ transform  resolve_fold循环
        最终结果
 ```
 
-### 2.2 详细代码流程
+### 3.2 详细代码流程
 
 **步骤1：路由选择**（dev_stack.erl:142-158）
 
@@ -312,9 +520,9 @@ resolve_fold(Message1, Message2, DevNum, Opts) ->
 
 ---
 
-## 三、状态传递机制
+## 四、状态传递机制
 
-### 3.1 消息即状态
+### 4.1 消息即状态
 
 在AO中，**消息就是状态**。每个设备处理后，返回的消息成为下一个设备的输入：
 
@@ -372,7 +580,7 @@ resolve_fold(Message1, Message2, DevNum, Opts) ->
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 前缀机制（数据隔离）
+### 4.2 前缀机制（数据隔离）
 
 每个设备有独立的输入输出前缀，防止数据冲突：
 
@@ -411,7 +619,7 @@ resolve_fold(Message1, Message2, DevNum, Opts) ->
 
 **说明**：数组格式会被 `hb_ao:normalize_keys` 自动转换为索引Map
 
-### 3.3 设备栈元数据（官方文档补充）
+### 4.3 设备栈元数据（官方文档补充）
 
 根据官方文档 `dev_stack.erl` 的完整定义，设备栈在执行过程中会添加以下元数据键：
 
@@ -563,9 +771,9 @@ maybe_error(Message1, Message2, DevNum, Info, Opts) ->
 
 ---
 
-## 四、特殊控制机制
+## 五、特殊控制机制
 
-### 4.1 Pass机制（重新执行）
+### 5.1 Pass机制（重新执行）
 
 设备可以返回`{pass, Message}`来重置执行：
 
@@ -599,7 +807,7 @@ pass变为2，重置到设备1
 - 如果没到时间，返回{pass, Msg}，继续等待
 - 如果到时间了，正常继续执行
 
-### 4.2 Skip机制（跳过剩余设备）
+### 5.2 Skip机制（跳过剩余设备）
 
 设备可以返回`{skip, Message}`来跳过剩余设备：
 
@@ -619,7 +827,7 @@ pass变为2，重置到设备1
     {ok, Message4};  %% 直接返回，不继续执行
 ```
 
-### 4.3 Error处理
+### 5.3 Error处理
 
 设备返回error时的处理策略：
 
@@ -646,7 +854,7 @@ maybe_error(Message1, Message2, DevNum, Info, Opts) ->
 
 ---
 
-## 五、Map模式（并行执行）
+## 六、Map模式（并行执行）
 
 除了Fold模式（顺序执行），还有Map模式（并行执行）：
 
@@ -698,9 +906,9 @@ Map模式（并行）：
 
 ---
 
-## 六、完整执行示例
+## 七、完整执行示例
 
-### 6.1 示例配置
+### 7.1 示例配置
 
 ```json
 /* 数组格式（推荐） */
@@ -732,7 +940,7 @@ Map模式（并行）：
 }
 ```
 
-### 6.2 详细执行流程
+### 7.2 详细执行流程
 
 ```
 用户消息：
@@ -804,9 +1012,9 @@ resolve_fold(Message1, Msg2, 1, Opts)
 
 ---
 
-## 七、HashPath管理
+## 八、HashPath管理
 
-### 7.1 核心定义：什么是HashPath
+### 8.1 核心定义：什么是HashPath
 
 **HashPath是一个滚动的Merkle列表**，记录了生成给定消息所应用的所有消息的历史。这是AO网络可验证计算的核心机制。
 
@@ -832,7 +1040,7 @@ Msg3.{...} = AO-Core.apply(Msg1, Msg2)
 - 每个新消息的HashPath = `SHA256(前一个HashPath, 新消息ID)`
 - 这允许单个消息代表一棵完整的消息历史树
 
-### 7.2 设备调用与HashPath更新的关系
+### 8.2 设备调用与HashPath更新的关系
 
 **核心发现**：每次设备调用都会产生新消息，并**立即**更新HashPath。
 
@@ -933,7 +1141,7 @@ end
   Msg3_4.priv.hashpath = Hash(Hash(Hash(Hash("abc123", Msg2_1.ID), Msg2_2.ID), Msg2_3.ID), Msg2_4.ID)
 ```
 
-### 7.3 HashPath算法
+### 8.3 HashPath算法
 
 HyperBEAM实现了两种HashPath算法（hb_path.erl:13675-13704）：
 
@@ -942,7 +1150,7 @@ HyperBEAM实现了两种HashPath算法（hb_path.erl:13675-13704）：
 | **`sha-256-chain`** | 简单的链式SHA-256哈希 | 默认算法，生产环境使用 |
 | **`accumulate-256`** | 累积多个ID的值到单个承诺 | 实验性，用于测试 |
 
-### 7.4 为什么HashPath完整性对设备栈至关重要
+### 8.4 为什么HashPath完整性对设备栈至关重要
 
 **问题背景**：
 
@@ -990,7 +1198,7 @@ returns {ok, /MsgN+1}              ← 返回最终结果
 /MsgN+1                            ← 最终消息，包含完整的HashPath链
 ```
 
-### 7.5 HashPath的价值总结
+### 8.5 HashPath的价值总结
 
 ```
 ┌────────────────────────────────────────────────────────────┐
@@ -1008,9 +1216,9 @@ returns {ok, /MsgN+1}              ← 返回最终结果
 
 ---
 
-## 八、总结
+## 九、总结
 
-### 8.1 核心结论
+### 9.1 核心结论
 
 **问题1：设备是怎么被调用的？**
 - ✅ `dev_stack`是统一的协调者
@@ -1027,11 +1235,11 @@ returns {ok, /MsgN+1}              ← 返回最终结果
 - ✅ 负责设备选择、调用、状态传递、错误处理
 
 **问题4：每个设备有不同的协作方式吗？**
-- ✅ 否，所有设备遵循统一的接口
+- ✅ 否，尽管设备接口是弱约束的（见第零章），但所有设备遵循统一的协作机制
 - ✅ 统一的返回值格式（{ok, Msg}、{pass, Msg}、{skip, Msg}、{error, Info}）
-- ✅ dev_stack统一处理各种情况
+- ✅ dev_stack统一处理各种返回值类型
 
-### 8.2 设备协作架构图
+### 9.2 设备协作架构图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -1076,7 +1284,7 @@ returns {ok, /MsgN+1}              ← 返回最终结果
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.3 置信度
+### 9.3 置信度
 
 本文所有结论基于HyperBEAM源码验证，置信度：**100%**
 
@@ -1086,10 +1294,11 @@ returns {ok, /MsgN+1}              ← 返回最终结果
 
 - [dev_stack.erl](file:///Users/yangjiefeng/Documents/permaweb/HyperBEAM/src/dev_stack.erl) - 设备栈核心实现
 - [hb_ao.erl](file:///Users/yangjiefeng/Documents/permaweb/HyperBEAM/src/hb_ao.erl) - 消息解析器
+- [hb_ao_device.erl](file:///Users/yangjiefeng/Documents/permaweb/HyperBEAM/src/hb_ao_device.erl) - 设备接口约束机制
 
 ---
 
-**文档版本**：1.0  
-**创建日期**：2024年  
-**验证依据**：HyperBEAM核心代码库源码  
-**核心贡献**：揭示设备栈协作机制，证明dev_stack是统一协调者
+**文档版本**：1.1（新增第零章：设备接口约束）
+**更新日期**：2026-02-09
+**验证依据**：HyperBEAM核心代码库源码
+**核心贡献**：揭示设备栈协作机制，证明dev_stack是统一协调者；新增弱约束设计原理说明
