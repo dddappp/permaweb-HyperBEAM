@@ -167,7 +167,123 @@ message_to_device(Msg, Opts) ->
 default() -> dev_message.  %% 默认设备是 dev_message
 ```
 
-### 1.3 直接调用 vs 容器调用
+### 1.3 设备方法调用机制
+
+**核心问题**：hb_ao:resolve 在阶段 5 确定设备后，如何调用该设备的哪个函数？
+
+**答案**：由消息中的 **`<<"path">>`** 字段指定！
+
+```erlang
+%% hb_ao.erl:525-538 (阶段 6 - 执行)
+resolve_stage(6, Func, Msg1, Msg2, ExecName, Opts) ->
+    Args = case hb_maps:get(add_key, Opts, false, Opts) of
+        false -> [Msg1, Msg2, Opts];      %% 3个参数
+        Key -> [Key, Msg1, Msg2, Opts]    %% 4个参数（含Key）
+    end,
+    Res = apply(Func, Args),              %% 执行函数
+    ...
+```
+
+**查找函数**（hb_ao_device.erl:48-103）：
+
+```erlang
+message_to_fun(Msg, Key, Opts) ->
+    Info = info(Dev, Msg, Opts),
+    %% 优先级 1：显式 handler
+    case {hb_maps:find(handler, Info), Exported} of
+        {{ok, Handler}, _} ->
+            {Status, Func} = info_handler_to_fun(Handler, Msg, Key, Opts),
+            {Status, Dev, Func};
+        _ ->
+            %% 优先级 2：同名函数
+            case {find_exported_function(Msg, Dev, Key, 3, Opts), Exported} of
+                {{ok, Func}, true} -> {ok, Dev, Func};
+                _ ->
+                    %% 优先级 3：default handler
+                    case {hb_maps:find(default, Info), Exported} of
+                        {{ok, DefaultFunc}, true} when is_function(DefaultFunc) ->
+                            {add_key, Dev, DefaultFunc};
+                        ...
+                    end
+            end
+    end.
+```
+
+#### 1.3.1 设备函数签名
+
+| 签名 | 调用方式 | 示例 |
+|------|----------|------|
+| `Function(Msg1, Msg2, Opts)` | 同名函数方式 | `compute(Msg1, Msg2, Opts)` |
+| `Function(Key, Msg1, Msg2, Opts)` | handler/default 方式 | `handler(<<"compute">>, Msg1, Msg2, Opts)` |
+
+#### 1.3.2 设备实现的 3 种方式
+
+**方式 A：导出同名函数**（最常见，推荐）
+
+```erlang
+-module(dev_cache).
+-export([read/3, write/3, link/3]).
+
+read(Msg1, Msg2, Opts) ->
+    {ok, Result}.
+```
+
+**方式 B：info 中指定 handler**
+
+```erlang
+-module(dev_lua).
+-export([info/2]).
+
+info(Msg, Opts) ->
+    #{
+        handler => fun compute/4
+    }.
+
+compute(Key, Msg1, Msg2, Opts) ->
+    {ok, Result}.
+```
+
+**方式 C：info 中指定 default**
+
+```erlang
+-module(my_device).
+-export([info/2]).
+
+info(Msg, Opts) ->
+    #{
+        default => fun default_handler/4
+    }.
+
+default_handler(Key, Msg1, Msg2, Opts) ->
+    {ok, Result}.
+```
+
+#### 1.3.3 前端如何指定调用哪个函数？
+
+**关键**：调用哪个函数由消息的 **`<<"path">>`** 字段决定！
+
+```erlang
+%% hb_ao.erl:139
+resolve(Msg1, Msg2, Opts) ->
+    PathParts = hb_path:from_message(request, Msg2, Opts),
+    MessagesToExec = [ Msg2#{ <<"path">> => Path } || Path <- PathParts ],
+    ...
+```
+
+**示例**：
+
+```
+HTTP: GET /~lua@5.3a/compute?code=xxx
+    ↓
+Msg2.<<"path">> = <<"compute">>
+Msg2.<<"device">> = <<"lua@5.3a">>
+    ↓
+hb_ao:resolve(Msg1, Msg2)
+    ↓ (阶段 5-6)
+调用 → lua@5.3a:compute/3  ← path="compute" 指定调用 compute 函数
+```
+
+### 1.4 直接调用 vs 容器调用
 
 AO 中的设备调用分为两种模式：
 
@@ -189,7 +305,7 @@ hb_ao:resolve (阶段 1-5)
                     └── lua@5.3a
 ```
 
-### 1.4 设备分类
+### 1.5 设备分类
 
 | 设备类型 | 示例 | 角色 | 调用方式 |
 |----------|------|------|----------|
@@ -199,7 +315,7 @@ hb_ao:resolve (阶段 1-5)
 | **辅助设备** | `dev_cache`, `dev_dedup` | 提供通用功能 | 直接调用 |
 | **容器设备** | `dev_stack` | 包含并管理多个子设备 | 内部递归调用 |
 
-### 1.5 device 字段的来源
+### 1.6 device 字段的来源
 
 `<<"device">>` 字段可以从以下几个来源设置：
 
@@ -210,7 +326,7 @@ hb_ao:resolve (阶段 1-5)
 | **子解析** | `{as, DevID, Msg}` 语法 | 切换到 `dev_cache` |
 | **HTTP 路径** | 解析请求路径 | `/~aojs@1.0/compute` |
 
-### 1.6 典型调用链示例
+### 1.7 典型调用链示例
 
 **示例 A：直接调用 dev_cache**
 ```
